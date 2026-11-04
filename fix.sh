@@ -4,25 +4,29 @@
 # чтобы к нему подключался Karing и другие клиенты на sing-box.
 #
 # Что делает:
-#   1. находит конфиг Xray в контейнере AmneziaVPN;
-#   2. делает резервную копию;
+#   1. находит конфиг Xray — на хосте или внутри контейнера amnezia-xray;
+#   2. делает резервную копию в /root/fix-xray-karing-backups;
 #   3. убирает flow xtls-rprx-vision у клиентов;
 #   4. ставит realitySettings.minClientVer = "1.0.0" (и убирает maxClientVer);
 #   5. перезапускает контейнер Xray;
-#   6. показывает, что получилось.
+#   6. печатает, что получилось.
 #
 # Запуск:
 #   bash <(curl -fsSL https://raw.githubusercontent.com/griggsdevel/fix-xray-karing/main/fix.sh)
 #
 # Откат:
-#   bash fix.sh --restore
+#   bash <(curl -fsSL https://raw.githubusercontent.com/griggsdevel/fix-xray-karing/main/fix.sh) --restore
 #
 # Никаких адресов, ключей и идентификаторов внутри нет — всё берётся с сервера.
 
 set -uo pipefail
 
-BACKUP_GLOB="config.json.bak.*"
-FOUND_CFG=""
+BACKUP_DIR=/root/fix-xray-karing-backups
+WORK=/tmp/fix-xray-karing-config.json
+MODE=""
+CFG=""
+CONT=""
+TS=$(date +%Y%m%d-%H%M%S)
 
 say()  { printf '\033[1;36m==>\033[0m %s\n' "$*"; }
 ok()   { printf '\033[1;32m  ✓\033[0m %s\n' "$*"; }
@@ -34,64 +38,131 @@ if [ "$(id -u)" -ne 0 ]; then
     exit 1
 fi
 
-# ---------- поиск конфига ----------
-find_config() {
+mkdir -p "$BACKUP_DIR"
+
+have_docker() { command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; }
+
+find_container() {
+    have_docker || return 1
+    local name
+    name=$(docker ps --format '{{.Names}}' 2>/dev/null | grep -i xray | head -1)
+    [ -n "$name" ] && { CONT="$name"; return 0; }
+    return 1
+}
+
+restart_xray() {
+    local done_restart=0
+    if have_docker; then
+        [ -n "$CONT" ] || find_container || true
+        if [ -n "$CONT" ]; then
+            docker restart "$CONT" >/dev/null 2>&1 && { ok "контейнер $CONT перезапущен"; done_restart=1; }
+        fi
+    fi
+    if [ "$done_restart" -eq 0 ]; then
+        local s
+        for s in xray amnezia-xray; do
+            if systemctl restart "$s" >/dev/null 2>&1; then
+                ok "служба $s перезапущена"
+                done_restart=1
+                break
+            fi
+        done
+    fi
+    [ "$done_restart" -eq 1 ] || warn "не смог перезапустить автоматически — перезапусти Xray в AmneziaVPN"
+}
+
+# ищет конфиг: сначала на хосте, потом внутри контейнера
+locate_config() {
     local p
     for p in \
         /opt/amnezia/xray/config.json \
+        /opt/amnezia/amnezia-xray/config.json \
         /opt/amnezia/xray/config/config.json \
-        /opt/amnezia/xray/xray/config.json \
         /etc/xray/config.json \
         /usr/local/etc/xray/config.json
     do
         if [ -f "$p" ]; then
-            FOUND_CFG="$p"
+            MODE=host
+            CFG="$p"
             return 0
         fi
     done
 
-    # поиск по системе, если стандартные пути не подошли
-    p=$(find /opt /etc /usr/local -maxdepth 5 -type f -name config.json 2>/dev/null \
-        | while read -r f; do
-              grep -q '"realitySettings"' "$f" 2>/dev/null && echo "$f" && break
-          done)
+    find_container || return 1
+
+    for p in \
+        /opt/amnezia/xray/config.json \
+        /opt/amnezia/amnezia-xray/config.json \
+        /etc/xray/config.json \
+        /usr/local/etc/xray/config.json \
+        /config.json
+    do
+        if docker exec "$CONT" test -f "$p" >/dev/null 2>&1; then
+            MODE=docker
+            CFG="$p"
+            return 0
+        fi
+    done
+
+    p=$(docker exec "$CONT" sh -c 'find / -maxdepth 4 -type f -name "*.json" 2>/dev/null | grep -v -E "^/proc|^/sys" | while read -r f; do grep -l realitySettings "$f" 2>/dev/null; done | head -1' 2>/dev/null)
     if [ -n "$p" ]; then
-        FOUND_CFG="$p"
+        MODE=docker
+        CFG="$p"
         return 0
     fi
     return 1
 }
 
+pull_config() {
+    if [ "$MODE" = "host" ]; then
+        cp "$CFG" "$WORK"
+    else
+        docker cp "$CONT:$CFG" "$WORK" >/dev/null 2>&1 || return 1
+    fi
+}
+
+push_config() {
+    if [ "$MODE" = "host" ]; then
+        cp "$WORK" "$CFG"
+    else
+        docker cp "$WORK" "$CONT:$CFG" >/dev/null 2>&1 || return 1
+    fi
+}
+
 # ---------- откат ----------
 if [ "${1:-}" = "--restore" ]; then
-    if ! find_config; then
-        err "конфиг Xray не найден"
+    meta=$(ls -1t "$BACKUP_DIR"/*.meta 2>/dev/null | head -1)
+    if [ -z "$meta" ]; then
+        err "резервных копий нет в $BACKUP_DIR"
         exit 1
     fi
-    last=$(ls -1t "$FOUND_CFG".bak.* 2>/dev/null | head -1)
-    [ -n "$last" ] || { err "резервных копий нет"; exit 1; }
-    cp "$last" "$FOUND_CFG"
-    ok "восстановлен из $(basename "$last")"
-    if command -v docker >/dev/null 2>&1; then
-        name=$(docker ps --format '{{.Names}}' | grep -i xray | head -1)
-        [ -n "$name" ] && docker restart "$name" >/dev/null && ok "контейнер $name перезапущен"
+    backup="${meta%.meta}.json"
+    read -r MODE CFG CONT < "$meta"
+    if [ "$MODE" = "host" ]; then
+        cp "$backup" "$CFG" || { err "не удалось записать $CFG"; exit 1; }
+    else
+        docker cp "$backup" "$CONT:$CFG" >/dev/null 2>&1 || { err "не удалось скопировать в $CONT:$CFG"; exit 1; }
     fi
+    ok "восстановлено из $(basename "$backup")"
+    restart_xray
     exit 0
 fi
 
+# ---------- основная работа ----------
 say "проверяю окружение"
-command -v docker >/dev/null 2>&1 || warn "docker не найден — перезапуск сделаю через systemctl, если получится"
+if have_docker; then
+    ok "docker работает"
+else
+    warn "docker недоступен — рассчитываю на обычную установку Xray"
+fi
 
 if ! command -v python3 >/dev/null 2>&1; then
     say "ставлю python3"
-    (apt-get update -qq && apt-get install -y -qq python3) >/dev/null 2>&1 || {
-        err "не удалось поставить python3"
-        exit 1
-    }
+    (apt-get update -qq && apt-get install -y -qq python3) >/dev/null 2>&1 || { err "не удалось поставить python3"; exit 1; }
 fi
 
 say "ищу конфиг Xray"
-if ! find_config; then
+if ! locate_config; then
     err "конфиг Xray не найден"
     echo
     echo "Что есть в /opt/amnezia:"
@@ -101,14 +172,23 @@ if ! find_config; then
     docker ps --format '  {{.Names}} ({{.Image}})' 2>/dev/null || echo "  docker недоступен"
     exit 1
 fi
-ok "конфиг: $FOUND_CFG"
+if [ "$MODE" = "host" ]; then
+    ok "конфиг на хосте: $CFG"
+else
+    ok "конфиг в контейнере $CONT: $CFG"
+fi
 
-backup="$FOUND_CFG.bak.$(date +%Y%m%d-%H%M%S)"
-cp "$FOUND_CFG" "$backup"
-ok "бэкап: $backup"
+if ! pull_config; then
+    err "не удалось прочитать конфиг"
+    exit 1
+fi
+
+cp "$WORK" "$BACKUP_DIR/config-$TS.json"
+printf '%s %s %s\n' "$MODE" "$CFG" "$CONT" > "$BACKUP_DIR/config-$TS.meta"
+ok "бэкап: $BACKUP_DIR/config-$TS.json"
 
 say "правлю конфиг"
-python3 - "$FOUND_CFG" <<'PY'
+python3 - "$WORK" <<'PY'
 import json
 import sys
 
@@ -152,24 +232,14 @@ else:
 print(f"  клиентов в конфиге: {clients_total}")
 PY
 
+if ! push_config; then
+    err "не удалось записать конфиг обратно"
+    exit 1
+fi
+ok "конфиг обновлён"
+
 say "перезапускаю Xray"
-restarted=0
-if command -v docker >/dev/null 2>&1; then
-    name=$(docker ps --format '{{.Names}}' | grep -i xray | head -1)
-    if [ -n "$name" ]; then
-        docker restart "$name" >/dev/null 2>&1 && { ok "контейнер $name перезапущен"; restarted=1; }
-    fi
-fi
-if [ "$restarted" -eq 0 ]; then
-    for s in xray amnezia-xray; do
-        if systemctl restart "$s" >/dev/null 2>&1; then
-            ok "служба $s перезапущена"
-            restarted=1
-            break
-        fi
-    done
-fi
-[ "$restarted" -eq 1 ] || warn "не смог перезапустить автоматически — перезапусти Xray в AmneziaVPN"
+restart_xray
 
 echo
 say "готово"
@@ -179,6 +249,6 @@ cat <<'EOF'
   в karing-editor.html у узла Xray поставь Flow = «нет»,
   скачай karing.json заново и обнови профиль в Karing.
 
-  Если что-то пошло не так — откат:
+  Откат:
     bash <(curl -fsSL https://raw.githubusercontent.com/griggsdevel/fix-xray-karing/main/fix.sh) --restore
 EOF
